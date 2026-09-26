@@ -26,6 +26,17 @@
   原表，任何既有快照内容都不随之改变；
 - 不存在的频道也可创建 watermark=0 的空快照（不创建频道行）。
 
+快照差异（diff_snapshots）不变式：
+- 只允许比较同一频道的两个既有快照；任一快照不存在 -> 404，
+  频道不一致 -> 409，校验失败不产生任何写入；
+- 差异基于快照冻结的生效内容：字幕以 effective_text 与
+  correction_version 判定，缺口以裁决区间端点 (start_seq, end_seq)
+  判定，两侧完全一致（含 kind 相同且内容相同）的序号不返回；
+- 按 seq 升序合并两份快照条目，差异分 added（仅对方有）/ removed
+  （仅基准有）/ changed（双方都有但内容不同）三类；after/limit 分页
+  只计差异条目，next_after 指向本页最后一条差异的 seq，稀疏差异
+  也不会因中间大量未变化条目而漏项。
+
 命名消费者拉取游标（consumers）不变式：
 - 每个 (channel, consumer) 的 cursor 只能经确认接口单调推进，且只能
   推进到当前租约批次 [lease_from, lease_to] 内的序号；
@@ -827,6 +838,154 @@ def list_snapshot_corrections(snapshot_id: str, seq: int) -> dict:
                 for row in rows
             ],
         }
+
+
+def diff_snapshots(
+    snapshot_id: str, other_snapshot_id: str, after: int = 0, limit: int = 1000
+) -> dict:
+    """比较同一频道两个快照的冻结生效内容，按 seq 合并返回差异。
+
+    路径快照为基准（base），other_snapshot_id 为对方（other）：
+    - added：seq 只存在于对方快照（基准冻结水位线之外的新内容）；
+    - removed：seq 只存在于基准快照（对方是更早快照时才会出现）；
+    - changed：两侧都有但冻结内容不同——字幕以生效文本（effective_text）
+      与更正版本（correction_version）判定，缺口以裁决区间端点
+      (start_seq, end_seq) 判定，kind 不同同样视为变更。
+    两侧完全一致的序号不返回。after/limit 只对差异条目计数，next_after
+    为本页最后一条差异的 seq（无差异时为 None），供下一页续拉。
+    """
+    with read_tx() as conn:
+        base = _get_snapshot_meta(conn, snapshot_id)
+        other = conn.execute(
+            "SELECT channel, watermark FROM snapshots WHERE snapshot_id = ?",
+            (other_snapshot_id,),
+        ).fetchone()
+        if other is None:
+            raise SnapshotError(
+                "snapshot_not_found",
+                f"快照 {other_snapshot_id} 不存在",
+                status_code=404,
+            )
+        if other["channel"] != base["channel"]:
+            raise SnapshotError(
+                "snapshot_channel_mismatch",
+                f"快照 {snapshot_id}（频道 {base['channel']}）与快照 "
+                f"{other_snapshot_id}（频道 {other['channel']}）不属于同一频道，"
+                "不能比较",
+                status_code=409,
+            )
+
+        # FULL OUTER JOIN 由两段 LEFT JOIN 的 UNION ALL 模拟：第一段覆盖
+        # “基准有 / 双方都有（且有差异）”，第二段补齐“仅对方有”。
+        # 差异过滤与 LIMIT 都落在合并后的 seq 序列上，因此未变化条目
+        # 不占 limit，再稀疏的差异也会被继续扫描出来。
+        # IS NOT 是 SQLite 的 NULL 安全不等号（NULL IS NOT NULL -> 0）。
+        rows = conn.execute(
+            """
+            SELECT * FROM (
+                SELECT b.seq                  AS seq,
+                       b.kind                 AS base_kind,
+                       b.revision             AS base_revision,
+                       b.effective_text       AS base_effective_text,
+                       b.correction_version   AS base_correction_version,
+                       b.start_seq            AS base_start_seq,
+                       b.end_seq              AS base_end_seq,
+                       o.kind                 AS other_kind,
+                       o.revision             AS other_revision,
+                       o.effective_text       AS other_effective_text,
+                       o.correction_version   AS other_correction_version,
+                       o.start_seq            AS other_start_seq,
+                       o.end_seq              AS other_end_seq
+                FROM snapshot_items b
+                LEFT JOIN snapshot_items o
+                       ON o.snapshot_id = ? AND o.seq = b.seq
+                WHERE b.snapshot_id = ? AND b.seq > ?
+                  AND (o.seq IS NULL
+                       OR b.kind               IS NOT o.kind
+                       OR b.effective_text     IS NOT o.effective_text
+                       OR b.correction_version IS NOT o.correction_version
+                       OR b.start_seq          IS NOT o.start_seq
+                       OR b.end_seq            IS NOT o.end_seq)
+                UNION ALL
+                SELECT o.seq                  AS seq,
+                       NULL, NULL, NULL, NULL, NULL, NULL,
+                       o.kind                 AS other_kind,
+                       o.revision             AS other_revision,
+                       o.effective_text       AS other_effective_text,
+                       o.correction_version   AS other_correction_version,
+                       o.start_seq            AS other_start_seq,
+                       o.end_seq              AS other_end_seq
+                FROM snapshot_items o
+                LEFT JOIN snapshot_items b
+                       ON b.snapshot_id = ? AND b.seq = o.seq
+                WHERE o.snapshot_id = ? AND o.seq > ?
+                  AND b.seq IS NULL
+            )
+            ORDER BY seq
+            LIMIT ?
+            """,
+            (
+                other_snapshot_id, snapshot_id, after,
+                snapshot_id, other_snapshot_id, after,
+                limit,
+            ),
+        ).fetchall()
+
+        items = []
+        for row in rows:
+            base_item = _diff_side_item(row, "base")
+            other_item = _diff_side_item(row, "other")
+            if base_item is None:
+                change = "added"
+            elif other_item is None:
+                change = "removed"
+            else:
+                change = "changed"
+            items.append(
+                {
+                    "change": change,
+                    "seq": row["seq"],
+                    "base": base_item,
+                    "other": other_item,
+                }
+            )
+
+        return {
+            "snapshot_id": snapshot_id,
+            "other_snapshot_id": other_snapshot_id,
+            "channel": base["channel"],
+            "watermark": base["watermark"],
+            "other_watermark": other["watermark"],
+            "items": items,
+            "next_after": items[-1]["seq"] if items else None,
+        }
+
+
+def _diff_side_item(row, side: str):
+    """从差异查询的 base_* / other_* 列构造一侧的冻结生效条目；该侧无此 seq 时为 None。"""
+    kind = row[f"{side}_kind"]
+    if kind is None:
+        return None
+    seq = row["seq"]
+    if kind == "gap":
+        return {
+            "kind": "gap",
+            "seq": seq,
+            "revision": None,
+            "text": None,
+            "start_seq": row[f"{side}_start_seq"],
+            "end_seq": row[f"{side}_end_seq"],
+            "correction_version": None,
+        }
+    return {
+        "kind": "subtitle",
+        "seq": seq,
+        "revision": row[f"{side}_revision"],
+        "text": row[f"{side}_effective_text"],
+        "start_seq": None,
+        "end_seq": None,
+        "correction_version": row[f"{side}_correction_version"],
+    }
 
 
 # ---------- 命名消费者拉取游标 ----------

@@ -23,6 +23,7 @@ from .schemas import (
     GapDecisionResponse,
     SnapshotCorrectionsResponse,
     SnapshotCreateIn,
+    SnapshotDiffResponse,
     SnapshotItemsEffectiveResponse,
     SnapshotItemsResponse,
     SnapshotResponse,
@@ -197,6 +198,37 @@ def get_snapshot_items(
 def list_snapshot_corrections(snapshot_id: str, seq: int) -> dict:
     """查询快照内某字幕序号在快照时刻冻结的全部更正版本（按 version 升序）。"""
     return service.list_snapshot_corrections(snapshot_id, seq)
+
+
+@app.get(
+    "/snapshots/{snapshot_id}/diff",
+    response_model=SnapshotDiffResponse,
+    responses={
+        404: {"description": "基准快照或 other 快照不存在", "model": ErrorResponse},
+        409: {"description": "两个快照不属于同一频道", "model": ErrorResponse},
+    },
+)
+def diff_snapshots(
+    snapshot_id: str,
+    other: str = Query(..., description="参与比较的对方快照 ID（必须与路径快照同频道）"),
+    after: int = Query(0, ge=0, description="只返回序号大于该值的差异条目"),
+    limit: int = Query(1000, ge=1, le=10000,
+                       description="每页最多返回的差异条目数（只计差异，未变化条目不占额度）"),
+) -> dict:
+    """比较同一频道两个快照的冻结生效内容。
+
+    以路径快照为基准、other 为对方，按 seq 升序合并两份快照条目：
+
+    - `added`：序号仅存在于 other 快照；
+    - `removed`：序号仅存在于基准快照；
+    - `changed`：两侧都有但内容不同——字幕按冻结的生效文本与
+      correction_version 判定，缺口按裁决区间端点判定；
+    - 两侧完全一致的序号不返回。
+
+    `limit` 只计差异条目，`next_after` 指向本页最后一条差异的 seq，
+    以其作为下一页的 `after` 续拉；本页为空时 `next_after=null`。
+    """
+    return service.diff_snapshots(snapshot_id, other, after=after, limit=limit)
 
 
 # ---------- 命名消费者拉取游标 ----------

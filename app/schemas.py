@@ -264,6 +264,43 @@ class SnapshotCorrectionsResponse(BaseModel):
     )
 
 
+# ---------- 快照差异 ----------
+
+
+class SnapshotDiffEntry(BaseModel):
+    change: Literal["added", "removed", "changed"] = Field(
+        ...,
+        description="差异类型：added=仅 other 快照存在；removed=仅基准快照存在；"
+        "changed=两侧都有但冻结生效内容不同",
+    )
+    seq: int = Field(..., description="差异条目序号（两份快照按 seq 合并）")
+    base: Optional[SnapshotEffectiveItem] = Field(
+        None, description="基准快照（路径 snapshot_id）冻结的生效内容；added 时为 null"
+    )
+    other: Optional[SnapshotEffectiveItem] = Field(
+        None,
+        description="对方快照（other 参数）冻结的生效内容；removed 时为 null",
+    )
+
+
+class SnapshotDiffResponse(BaseModel):
+    snapshot_id: str = Field(..., description="基准快照 ID（路径参数）")
+    other_snapshot_id: str = Field(..., description="对方快照 ID（other 查询参数）")
+    channel: str = Field(..., description="两个快照共同所属的频道")
+    watermark: int = Field(..., description="基准快照锁定的水位线")
+    other_watermark: int = Field(..., description="对方快照锁定的水位线")
+    items: List[SnapshotDiffEntry] = Field(
+        ...,
+        description="本页差异条目，按 seq 升序；两侧完全一致的序号不返回。"
+        "字幕以生效文本与 correction_version 判定，缺口以区间端点判定",
+    )
+    next_after: Optional[int] = Field(
+        None,
+        description="下一页游标：本页最后一条差异的 seq，以此作为 after 续拉；"
+        "本页为空（无更多差异）时为 null",
+    )
+
+
 # ---------- 命名消费者拉取游标 ----------
 
 
