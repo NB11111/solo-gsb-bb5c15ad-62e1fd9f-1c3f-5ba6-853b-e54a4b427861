@@ -26,6 +26,16 @@
   原表，任何既有快照内容都不随之改变；
 - 不存在的频道也可创建 watermark=0 的空快照（不创建频道行）。
 
+快照差异（diff_snapshots）不变式：
+- 差异只读取 snapshot_items 的冻结内容，比较结果与查询时刻的实时
+  定稿状态无关；两个快照必须属于同一频道，否则拒绝且不产生任何读取
+  之外的副作用；
+- 按 seq 归并两份快照条目：仅 to 侧存在为 added，仅 from 侧存在为
+  removed，两侧都存在但内容不同为 changed；字幕以冻结的生效文本与
+  更正版本判断，缺口以裁决区间端点判断，未变化的序号不出现在结果中；
+- 分页 limit 只计差异条目，after/next_after 以差异序号推进，稀疏
+  变化下逐页遍历不会漏项。
+
 命名消费者拉取游标（consumers）不变式：
 - 每个 (channel, consumer) 的 cursor 只能经确认接口单调推进，且只能
   推进到当前租约批次 [lease_from, lease_to] 内的序号；
@@ -827,6 +837,132 @@ def list_snapshot_corrections(snapshot_id: str, seq: int) -> dict:
                 for row in rows
             ],
         }
+
+
+def diff_snapshots(from_id: str, to_id: str, after: int = 0, limit: int = 1000) -> dict:
+    """比较同一频道两个快照的冻结生效内容，按 seq 归并返回差异。
+
+    - added：仅存在于 to 快照的序号；removed：仅存在于 from 快照的序号；
+      changed：两侧都存在但内容不同——字幕以冻结的生效文本与更正版本
+      判断，缺口以裁决区间端点判断；未变化的序号不返回；
+    - after/limit 分页：limit 只计差异条目，next_after 指向本页最后一条
+      差异的 seq；两个游标流式归并，稀疏变化也不会漏项；
+    - 两个快照必须属于同一频道，否则 409 cross_channel_diff；任一快照
+      不存在返回 404 snapshot_not_found。
+    """
+    with read_tx() as conn:
+        from_meta = _get_snapshot_meta(conn, from_id)
+        to_meta = _get_snapshot_meta(conn, to_id)
+        if from_meta["channel"] != to_meta["channel"]:
+            raise SnapshotError(
+                "cross_channel_diff",
+                f"快照 {from_id}（频道 {from_meta['channel']}）与快照 {to_id}"
+                f"（频道 {to_meta['channel']}）不属于同一频道，无法比较",
+                status_code=409,
+            )
+
+        select = (
+            "SELECT seq, kind, revision, effective_text, correction_version, "
+            "start_seq, end_seq FROM snapshot_items "
+            "WHERE snapshot_id = ? AND seq > ? ORDER BY seq"
+        )
+        from_rows = conn.execute(select, (from_id, after))
+        to_rows = conn.execute(select, (to_id, after))
+
+        diffs = []
+        from_row = from_rows.fetchone()
+        to_row = to_rows.fetchone()
+        # 双游标按 seq 归并：每轮至少推进一侧，集满 limit 条差异即停
+        while len(diffs) < limit and (from_row is not None or to_row is not None):
+            if from_row is not None and (
+                to_row is None or from_row["seq"] < to_row["seq"]
+            ):
+                diffs.append(
+                    {
+                        "change": "removed",
+                        "seq": from_row["seq"],
+                        "from_item": _diff_side(from_row),
+                        "to_item": None,
+                    }
+                )
+                from_row = from_rows.fetchone()
+            elif to_row is not None and (
+                from_row is None or to_row["seq"] < from_row["seq"]
+            ):
+                diffs.append(
+                    {
+                        "change": "added",
+                        "seq": to_row["seq"],
+                        "from_item": None,
+                        "to_item": _diff_side(to_row),
+                    }
+                )
+                to_row = to_rows.fetchone()
+            else:
+                changed = _diff_changed(from_row, to_row)
+                if changed is not None:
+                    diffs.append(changed)
+                from_row = from_rows.fetchone()
+                to_row = to_rows.fetchone()
+
+        return {
+            "channel": from_meta["channel"],
+            "from_snapshot_id": from_id,
+            "to_snapshot_id": to_id,
+            "from_watermark": from_meta["watermark"],
+            "to_watermark": to_meta["watermark"],
+            "next_after": diffs[-1]["seq"] if diffs else None,
+            "items": diffs,
+        }
+
+
+def _diff_side(row) -> dict:
+    """快照条目在差异中的单侧视图：字幕带生效文本与更正版本，缺口带区间端点。"""
+    if row["kind"] == "gap":
+        return {
+            "kind": "gap",
+            "revision": None,
+            "text": None,
+            "correction_version": None,
+            "start_seq": row["start_seq"],
+            "end_seq": row["end_seq"],
+        }
+    return {
+        "kind": "subtitle",
+        "revision": row["revision"],
+        "text": row["effective_text"],
+        "correction_version": row["correction_version"],
+        "start_seq": None,
+        "end_seq": None,
+    }
+
+
+def _diff_changed(from_row, to_row) -> "dict | None":
+    """比较同一序号在两快照中的冻结内容；无变化返回 None。
+
+    字幕以生效文本与更正版本判断，缺口以裁决区间端点判断；
+    条目类型不同（字幕 <-> 缺口）一律视为变更。
+    """
+    if from_row["kind"] != to_row["kind"]:
+        changed = True
+    elif from_row["kind"] == "gap":
+        changed = (
+            from_row["start_seq"] != to_row["start_seq"]
+            or from_row["end_seq"] != to_row["end_seq"]
+        )
+    else:
+        changed = (
+            from_row["effective_text"] != to_row["effective_text"]
+            or from_row["correction_version"] != to_row["correction_version"]
+        )
+    if not changed:
+        return None
+    return {
+        "change": "changed",
+        "seq": from_row["seq"],
+        "from_item": _diff_side(from_row),
+        "to_item": _diff_side(to_row),
+    }
 
 
 # ---------- 命名消费者拉取游标 ----------

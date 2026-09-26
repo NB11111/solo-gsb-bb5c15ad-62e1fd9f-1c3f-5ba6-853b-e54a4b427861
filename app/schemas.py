@@ -264,6 +264,52 @@ class SnapshotCorrectionsResponse(BaseModel):
     )
 
 
+class SnapshotDiffSide(BaseModel):
+    kind: str = Field(..., description="条目类型：subtitle=字幕；gap=永久缺口标记")
+    revision: Optional[int] = Field(None, description="原始修订号（仅字幕条目存在）")
+    text: Optional[str] = Field(
+        None, description="该快照时刻冻结的生效文本（仅字幕条目存在）"
+    )
+    correction_version: Optional[int] = Field(
+        None,
+        description="该快照时刻冻结的最新更正版本（仅字幕条目存在，0=快照时未更正）",
+    )
+    start_seq: Optional[int] = Field(None, description="缺口区间起点（仅缺口条目存在）")
+    end_seq: Optional[int] = Field(None, description="缺口区间终点（仅缺口条目存在）")
+
+
+class SnapshotDiffItem(BaseModel):
+    change: Literal["added", "removed", "changed"] = Field(
+        ...,
+        description=(
+            "差异类型：added=仅 to 快照存在；removed=仅 from 快照存在；"
+            "changed=两侧都存在但冻结内容不同"
+        ),
+    )
+    seq: int = Field(..., description="发生差异的序号")
+    from_item: Optional[SnapshotDiffSide] = Field(
+        None, description="from 快照中的条目内容（added 时为 null）"
+    )
+    to_item: Optional[SnapshotDiffSide] = Field(
+        None, description="to 快照中的条目内容（removed 时为 null）"
+    )
+
+
+class SnapshotDiffResponse(BaseModel):
+    channel: str = Field(..., description="两个快照所属的同一频道")
+    from_snapshot_id: str
+    to_snapshot_id: str
+    from_watermark: int = Field(..., description="from 快照锁定的水位线")
+    to_watermark: int = Field(..., description="to 快照锁定的水位线")
+    next_after: Optional[int] = Field(
+        None,
+        description="本页最后一条差异的序号，作为下一页的 after 继续拉取；本页无差异时为 null",
+    )
+    items: List[SnapshotDiffItem] = Field(
+        ..., description="本页差异条目，按 seq 升序；limit 只计差异条目"
+    )
+
+
 # ---------- 命名消费者拉取游标 ----------
 
 

@@ -23,6 +23,7 @@ from .schemas import (
     GapDecisionResponse,
     SnapshotCorrectionsResponse,
     SnapshotCreateIn,
+    SnapshotDiffResponse,
     SnapshotItemsEffectiveResponse,
     SnapshotItemsResponse,
     SnapshotResponse,
@@ -40,8 +41,8 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Live Subtitle Finalizer",
     summary="直播字幕定稿服务：乱序片段缓冲、按连续前缀推进水位线并定稿；"
-    "支持追加式更正、不可变发布快照与命名消费者拉取游标",
-    version="1.3.0",
+    "支持追加式更正、不可变发布快照、快照差异比较与命名消费者拉取游标",
+    version="1.4.0",
     lifespan=lifespan,
 )
 
@@ -197,6 +198,33 @@ def get_snapshot_items(
 def list_snapshot_corrections(snapshot_id: str, seq: int) -> dict:
     """查询快照内某字幕序号在快照时刻冻结的全部更正版本（按 version 升序）。"""
     return service.list_snapshot_corrections(snapshot_id, seq)
+
+
+@app.get(
+    "/snapshots/diff",
+    response_model=SnapshotDiffResponse,
+    responses={
+        404: {"description": "任一快照不存在", "model": ErrorResponse},
+        409: {"description": "两个快照不属于同一频道", "model": ErrorResponse},
+    },
+)
+def diff_snapshots(
+    from_: str = Query(..., alias="from", description="基准快照 ID（差异的 from 侧）"),
+    to: str = Query(..., description="目标快照 ID（差异的 to 侧）"),
+    after: int = Query(0, ge=0, description="只返回序号大于该值的差异条目"),
+    limit: int = Query(1000, ge=1, le=10000, description="本页最多返回的差异条目数"),
+) -> dict:
+    """比较同一频道两个快照的冻结生效内容，按 seq 归并返回差异。
+
+    - `added`：仅 to 快照存在的序号；`removed`：仅 from 快照存在的序号；
+      `changed`：两侧都存在但内容不同——字幕以冻结的生效文本与更正版本
+      判断，缺口以裁决区间端点判断；未变化的序号不返回；
+    - `limit` 只计差异条目，`next_after` 指向本页最后一条差异的序号，
+      以其作为下一页 `after` 翻页，稀疏变化也不会漏项；
+    - 两个快照必须属于同一频道（409 `cross_channel_diff`）；任一快照
+      不存在返回 404 `snapshot_not_found`。
+    """
+    return service.diff_snapshots(from_, to, after=after, limit=limit)
 
 
 # ---------- 命名消费者拉取游标 ----------
